@@ -1,0 +1,128 @@
+name: PR Preview Environment
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: public.ecr.aws/n2m7q4i4/pr-demo-app
+  ARGOCD_APP_NAME: pr-demo
+
+jobs:
+  build-and-push:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+        with:
+          mask-password: 'true'
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Update manifest repository
+        env:
+          IMAGE_TAG: pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Clone the manifests repo (same repo in this case)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Create PR-specific manifest
+          mkdir -p k8s/overlays/pr-$PR_NUMBER
+
+          cat > k8s/overlays/pr-$PR_NUMBER/kustomization.yaml <<EOF
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          namespace: pr-$PR_NUMBER
+          namePrefix: pr-$PR_NUMBER-
+          resources:
+            - ../../base
+          images:
+            - name: APP_IMAGE
+              newName: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+              newTag: $IMAGE_TAG
+          EOF
+
+          git add k8s/overlays/pr-$PR_NUMBER/
+          git commit -m "Add manifest for PR #$PR_NUMBER" || echo "No changes to commit"
+          git push origin HEAD:main
+
+      - name: Comment PR with preview URL
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const comment = `##  PR Environment Deployed
+
+            Your preview environment is being deployed!
+
+            **Namespace:** \`pr-${prNumber}\`
+            **Image:** \`${{ steps.build-image.outputs.image }}\`
+
+            Wait a few minutes for ArgoCD to sync, then access your environment.
+
+            Check ArgoCD for deployment status.`;
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: comment
+            });
+
+  cleanup:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Remove PR manifest
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          rm -rf k8s/overlays/pr-$PR_NUMBER
+          git add k8s/overlays/
+          git commit -m "Remove manifest for PR #$PR_NUMBER" || echo "No changes to commit"
+          git push origin HEAD:main
+
+      - name: Comment PR with cleanup message
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `##  PR Environment Cleaned Up\n\nThe preview environment for PR #${prNumber} has been removed.`
+            });
